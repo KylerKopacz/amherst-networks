@@ -29,30 +29,29 @@ public class CRCDataLinkLayer extends DataLinkLayer {
   * @param  data The raw sequence of bytes to be framed.
   * @return A complete frame.
   */
-  protected byte[] createFrame (byte[] data) {
+  public byte[] createFrame (byte[] data) {
 
     Queue<Byte> framingData = new LinkedList<Byte>();
 
     // Begin with the start tag.
     framingData.add(startTag);
 
-    //prolly a good idea to get the remainder and add it to the end of the frame
-    byte crc = getCRC8(data);
+    //add the ACK/NAK or data frame byte
+    //this will be a 0 because it's not an ACK/NAK and there's no status for it
+    framingData.add((byte) 0);
 
-    //copy the data to a new array
-    byte[] newData = new byte[data.length + 1];
-    for(int i = 0; i < data.length; i++) {
-      newData[i] = data[i];
-    }
-    //add the crc byte at the end
-    newData[newData.length - 1] = crc;
+    //we are going to do frame 0 and frame 1, for simplicity's sake
+    framingData.add(sentFrameNumber);
+
+    //now we add the CRC of the data
+    framingData.add(getCRC8(data));
 
     // Add each byte of original data.
-    for (int i = 0; i < newData.length; i += 1) {
+    for (int i = 0; i < data.length; i += 1) {
 
       // If the current data byte is itself a metadata tag, then precede
       // it with an escape tag.
-      byte currentByte = newData[i];
+      byte currentByte = data[i];
       if ((currentByte == startTag) ||
       (currentByte == stopTag) ||
       (currentByte == escapeTag)) {
@@ -190,6 +189,7 @@ public class CRCDataLinkLayer extends DataLinkLayer {
     return (byte) dividend;
   } //getCRC8()
   // =========================================================================
+
   /**
   * Send a sequence of bytes through the physical layer.  Expected to be
   * called by the client.
@@ -198,13 +198,15 @@ public class CRCDataLinkLayer extends DataLinkLayer {
   */
   public void send (byte[] data) {
 
-    // Call on the underlying physical layer to send the data.
-    byte[] framedData = frameData(data);
-    for (int i = 0; i < framedData.length; i += 1) {
-      transmit(framedData[i]);
+    // Buffer the data to send.
+    bufferForSending(data);
+
+    // Send until the buffer is empty.
+    while (sendBuffer.peek() != null) {
+      sendNextFrame();
     }
 
-  } //send()
+  }
   // =========================================================================
   /**
   * Determine whether the received, buffered data constitutes a complete
@@ -215,11 +217,11 @@ public class CRCDataLinkLayer extends DataLinkLayer {
   * @return If the buffer contains a complete frame, the extracted, original
   * data; <code>null</code> otherwise.
   */
-  protected byte[] processFrame() {
+  protected Queue<Byte> processFrame() {
 
     // Search for a start tag.  Discard anything prior to it.
     boolean startTagFound = false;
-    Iterator<Byte> i = byteBuffer.iterator();
+    Iterator<Byte> i = receiveBuffer.iterator();
     while (!startTagFound && i.hasNext()) {
       byte current = i.next();
       if (current != startTag) {
@@ -275,63 +277,25 @@ public class CRCDataLinkLayer extends DataLinkLayer {
       return null;
     }
 
-    // Convert to the desired byte array.
-    if (debug) {
-      System.out.println("CRCDataLinkLayer.processFrame(): Got whole frame!");
-    }
-    byte[] extractedData = new byte[extractedBytes.size()];
-    int j = 0;
-    i = extractedBytes.iterator();
-    while (i.hasNext()) {
-      extractedData[j] = i.next();
-      if (debug) {
-        System.out.printf("CRCDataLinkLayer.processFrame():\tbyte[%d] = %c\n",
-        j,
-        extractedData[j]);
-      }
-      j += 1;
-    }
+    //lets see what is in the queue
+    Iterator<Byte> j = extractedBytes.iterator();
+    //System.out.println("DEBUG");
+    // while(j.hasNext()) {
+    //   System.out.print(j.next().byteValue() + " ");
+    // }
+    //System.out.println();
 
-    //make a new array but remove the last byte because that is the checksum
-    byte[] dataNoChecksum;
-    if(extractedData.length > 0) {
-      dataNoChecksum = new byte[extractedData.length - 1];
-    } else {
-      return null;
-    }
-    for(int k = 0; k < dataNoChecksum.length; k++) {
-      dataNoChecksum[k] = extractedData[k];
-    }
-
-    byte checkSum = extractedData[extractedData.length - 1];
-
-
-    //now if we run CRC on the extracted data, and we get a 0 remainder
-    //then the message got through okay
-    byte calculatedCRC = getCRC8(dataNoChecksum);
-    if(calculatedCRC == checkSum) {
-      return dataNoChecksum;
-    } else {
-      //print out the corrupted data message and return that
-      System.out.print("CRC Error! (data:");
-      for(byte b: dataNoChecksum) {
-        System.out.print(b + " ");
-      }
-      System.out.println(") (CRC Recieved: " + checkSum +
-        " CRC calculated: " + calculatedCRC + ")");
-
-      return null;
-    }
-
+    return extractedBytes;
   } // processFrame ()
   // ===============================================================
+
 
 
 
   // ===============================================================
   private void cleanBufferUpTo (Iterator<Byte> end) {
 
-    Iterator<Byte> i = byteBuffer.iterator();
+    Iterator<Byte> i = receiveBuffer.iterator();
     while (i.hasNext() && i != end) {
       i.next();
       i.remove();
@@ -339,8 +303,215 @@ public class CRCDataLinkLayer extends DataLinkLayer {
 
   }
   // ===============================================================
+  /**
+  * An entire frame has been received.  Complete its processing, which may
+  * involve checking its correctness, responding to the sender, and/or
+  * delivering the frame to the client (if correct).  Called by
+  * <code>receive()</code>.
+  *
+  * @param data The de-tagged contents extracted from the frame.
+  * @see   DataLinkLayer.receive
+  */
+  protected void finishFrameReceive (Queue<Byte> data) {
+    //we need to extract the metadata out of the frame
+    Iterator<Byte> i = data.iterator();
+
+    //first is the whether or not this is an ACK/NAK frame
+    if(i.hasNext()) {
+      byte ackStatus = i.next();
+      if(ackStatus >> 4 == 1) {//we do nothing, because finishFrameSend will be called to parse response
+        //then we just get out of here
+        ackStuff = data;
+        return;
+      }
+    }
+
+    //next is the frame number
+    byte frameNumber = -1;
+    if(i.hasNext()) {
+      frameNumber = i.next();
+    }
+
+    //next we do the CRC checksum
+    byte crc = 0;
+    if(i.hasNext()) {
+      crc = i.next();
+    }
 
 
+    //the rest of the frame is the data
+    byte[] extractedData = new byte[data.size() - 3];
+    for(int j = 0; j < extractedData.length && i.hasNext(); j++) {
+      extractedData[j] = i.next();
+    }
+
+    //send this data to get CRC
+    byte messageCRC = getCRC8(extractedData);
+
+    //if this doesn't match, then send NAK frame
+    if(messageCRC != crc) {
+      //System.out.println("CRC doesn't match, sending NAK frame");
+      sendNAKFrame(receivedFrameNumber);
+      return;
+    } else if(frameNumber != receivedFrameNumber) {
+      //the only way that these would be out of sync is
+      //if the ACK frame didn't go through correctly.
+      //so send an ACK Frame with the other confirmation number
+      if(receivedFrameNumber == 0) {
+        sendACKFrame((byte) 1);
+      } else {
+        sendACKFrame((byte) 0);
+      }
+      return;
+    } else {//the data is legit, pass it to the host
+      client.receive(extractedData);
+      //System.out.println("Sending ACK FRAME! NOICE");
+      sendACKFrame(receivedFrameNumber);
+      if(receivedFrameNumber == 0) {
+        receivedFrameNumber = 1;
+        //System.out.println("Setting receivedFrameNumber to " + receivedFrameNumber);
+      } else {
+        receivedFrameNumber = 0;
+        //System.out.println("Setting receivedFrameNumber to " + receivedFrameNumber);
+      }
+    }
+  } //finishFrameReceive()
+  // ===============================================================
+
+  /* Sends a NAK frame to the host, requiring it to send the frame again
+  */
+  protected void sendNAKFrame(byte num) {
+    byte[] nakFrame = new byte[5];
+
+    //start tag
+    nakFrame[0] = startTag;
+    //NAK byte = 0b00010000
+    nakFrame[1] = (byte) 16;
+    //frame number of error
+    nakFrame[2] = num;
+    //CRC of the stuff before
+    byte[] thing = {(byte) 16, receivedFrameNumber};
+    nakFrame[3] = getCRC8(thing);
+    //stop tag
+    nakFrame[4] = stopTag;
+
+    transmit(nakFrame);
+  }
+  // ===============================================================
+
+  protected void sendACKFrame(byte num) {
+    byte[] ackFrame = new byte[5];
+
+    //start tag
+    ackFrame[0] = startTag;
+    //ACK byte = 0b00010001
+    ackFrame[1] = (byte) 17;
+    //frame number of error
+    ackFrame[2] = num;
+    //CRC of the stuff before
+    byte[] thing = {(byte) 17, receivedFrameNumber};
+    ackFrame[3] = getCRC8(thing);
+    //stop tag
+    ackFrame[4] = stopTag;
+
+    transmit(ackFrame);
+  }
+  // ===============================================================
+
+  /**
+  * Extract the next frame-worth of data from the sending buffer, frame it,
+  * and then send it.
+  */
+  protected void sendNextFrame() {
+
+    // Extract a frame-worth of data from the sending buffer.
+    int frameSize = ((sendBuffer.size() < MAX_FRAME_SIZE)
+    ? sendBuffer.size()
+    : MAX_FRAME_SIZE);
+    byte[]         data = new byte[frameSize];
+    Iterator<Byte>    i = sendBuffer.iterator();
+    for (int j = 0; j < frameSize; j += 1) {
+      data[j] = i.next();
+      i.remove();
+    }
+
+    // Frame and transmit this chunk.
+    byte[] framedData = createFrame(data);
+    do {
+      transmit(framedData);
+    } while(!finishFrameSend());
+  } // sendNextFrame ()
+
+  // ===============================================================
+
+  /**
+  * Complete the process of sending a frame.  This method will examine the recieved data
+  * from the response of the receiver, and return whether we can send the next frame
+  * not.
+  *
+  * @return Return whether we need to send the frame again or not
+  */
+  protected boolean finishFrameSend() {
+    //we can expect the response to be 2 bytes long, one with the
+    //ACK/NAK frame and one with the CRC of that data to make sure
+    //that is arrived okay
+    Iterator<Byte> responseMessage;
+    if(ackStuff != null) {
+      responseMessage = ackStuff.iterator();
+    } else {
+        //something has went wrong. This should fix my null pointer exception
+        return false;
+    }
+
+    if(responseMessage == null) {
+      return false;
+    }
+    //parse all the information in the response frame
+    byte messageConfirmation = responseMessage.next();
+    byte frameConfirmation = responseMessage.next();
+    byte CRC = responseMessage.next();
+    byte[] stuff = {messageConfirmation, frameConfirmation};
+
+    //now we can clear the ack buffer
+    while(responseMessage.hasNext()) {
+      try{
+        responseMessage.remove();
+      } catch (IllegalStateException e) {
+        //I really don't know what to do with it
+        //break i guess?
+        break;
+      }
+    }
+
+    //now we do our checks
+    if((messageConfirmation & 0x1) == 0b00000001) {//then our message is a confirmation
+      if(frameConfirmation == sentFrameNumber) {
+        if(sentFrameNumber == 0) {
+          sentFrameNumber = 1;
+          //System.out.println("Setting sentFrameNumber to " + sentFrameNumber);
+          return true;
+        } else {
+          sentFrameNumber = 0;
+          //System.out.println("Setting sentFrameNumber to " + sentFrameNumber);
+          return true;
+        }
+      } else {
+        //there was something wrong with the ack
+        //System.out.println("Frame number or CRC was wrong in ACK frame. Resending.");
+        return false;
+      }
+      //advance the frame number, and return true
+    } else if((messageConfirmation & 0x1) == 0){//then the receiver did not get the frame correctly, and we cannot advance
+      //System.out.println("NAK Frame received. Sending last frame again");
+      return false;
+    } else {
+      //something else is wrong. Just send the message again
+      //System.out.println("Something really went wrong with ACK/NAK. Resending.");
+      return false;
+    }
+
+  }
+  // ===============================================================
 
   // ===============================================================
   // DATA MEMBERS
@@ -354,9 +525,12 @@ public class CRCDataLinkLayer extends DataLinkLayer {
   private final byte stopTag   = (byte)'}';
   private final byte escapeTag = (byte)'\\';
   // ===============================================================
+  //the boolean that dictates the frame number
+  private byte sentFrameNumber = 0;
+  private byte receivedFrameNumber = 0;
 
-
-
+  //a queue that is only used when needed
+  Queue<Byte> ackStuff;
   // ===================================================================
 } // class DumbDataLinkLayer
 // ===================================================================

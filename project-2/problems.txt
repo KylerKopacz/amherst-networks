@@ -1,0 +1,12 @@
+There are a few things that I cannot seem to find a fix for in my code. I have worked on this lab for a super long time and I have yet to find something that works, so I am going to simply document the problems. 
+
+First, I am getting repeated information for some reason. This happens when an ACK/NAK frame gets sent back and then get corrupted in transit. The frame numbers get out of sync and the receiver can't tell that it has already received some of the information before, so it just accepts it multiple times. I don't really know how to fix this. I have tried it just sending an ACK frame when it receives data that does not have the right frame number, and not saving it, in an attempt to fix the sender. But this doesn't seem to have worked for some reason.
+
+Another rare problem that I get is that my buffer is null when it gets called in finishFrameSend. This literally should not happen and I have no idea why it does. This is rare though. 
+
+Third problem is that I will get an "Illegal State exception" and I don't even know what that is. It's even more rare than the null pointer though, so I don't know how I could fix that at all. 
+
+I don't know what else I can do.
+
+Thanks, 
+Kyler Kopacz

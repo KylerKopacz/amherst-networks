@@ -3,6 +3,7 @@
 
 import java.util.LinkedList;
 import java.util.Queue;
+import java.util.Iterator;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.InvocationTargetException;
 // =============================================================================
@@ -43,15 +44,17 @@ public abstract class DataLinkLayer {
   *                          the given physical layer doesn't exist (is
   *                          <code>null</code>).
   */
-  public static DataLinkLayer create (String type, PhysicalLayer physicalLayer, Host host) {
+  public static DataLinkLayer create (String type,
+  PhysicalLayer physicalLayer,
+  Host host) {
 
     if (physicalLayer == null) {
       throw new RuntimeException("Null physical layer");
     }
 
     // Look up the class by name.
-    String className = type + "DataLinkLayer";
-    Class dataLinkLayerClass  = null;
+    String className           = type + "DataLinkLayer";
+    Class  dataLinkLayerClass  = null;
     try {
       dataLinkLayerClass = Class.forName(className);
     } catch (ClassNotFoundException e) {
@@ -84,8 +87,9 @@ public abstract class DataLinkLayer {
     dataLinkLayer.register(host);
 
     // Create incoming buffer space.
-    dataLinkLayer.bitBuffer  = new LinkedList<Boolean>();
-    dataLinkLayer.byteBuffer = new LinkedList<Byte>();
+    dataLinkLayer.bitBuffer     = new LinkedList<Boolean>();
+    dataLinkLayer.receiveBuffer = new LinkedList<Byte>();
+    dataLinkLayer.sendBuffer    = new LinkedList<Byte>();
     return dataLinkLayer;
 
   } // create ()
@@ -120,13 +124,64 @@ public abstract class DataLinkLayer {
   */
   public void send (byte[] data) {
 
-    // Call on the underlying physical layer to send the data.
-    byte[] framedData = createFrame(data);
-    for (int i = 0; i < framedData.length; i += 1) {
-      transmit(framedData[i]);
+    // Buffer the data to send.
+    bufferForSending(data);
+
+    // Send until the buffer is empty.
+    while (sendBuffer.peek() != null) {
+      sendNextFrame();
     }
 
   }
+  // =========================================================================
+
+
+
+  // =========================================================================
+  /**
+  * Accept an arbitrary sequence of bytes (of any length) and buffer it for
+  * sending.
+  *
+  * @param data The sequence of bytes to buffer.
+  */
+  protected void bufferForSending (byte[] data) {
+
+    // Add each byte to the sending buffer.
+    for (int i = 0; data != null && i < data.length; i += 1) {
+      sendBuffer.add(data[i]);
+    }
+
+  } // bufferForSending ()
+  // =========================================================================
+
+
+
+  // =========================================================================
+  /**
+  * Extract the next frame-worth of data from the sending buffer, frame it,
+  * and then send it.
+  */
+  protected void sendNextFrame() {
+
+    // Extract a frame-worth of data from the sending buffer.
+    int frameSize = ((sendBuffer.size() < MAX_FRAME_SIZE)
+    ? sendBuffer.size()
+    : MAX_FRAME_SIZE);
+    byte[]         data = new byte[frameSize];
+    Iterator<Byte>    i = sendBuffer.iterator();
+    for (int j = 0; j < frameSize; j += 1) {
+      data[j] = i.next();
+      i.remove();
+    }
+
+    // Frame and transmit this chunk.
+    byte[] framedData = createFrame(data);
+    transmit(framedData);
+
+    // Finish any bookkeeping with respect to this frame having been sent.
+    finishFrameSend();
+
+  } // sendNextFrame ()
   // =========================================================================
 
 
@@ -145,30 +200,38 @@ public abstract class DataLinkLayer {
 
   // =========================================================================
   /**
-  * Transmit a byte as bits.  Expected to be called by a subclass
-  * in performing a <code>send()</code>.
-  *
-  * @param data The byte of data to send.
+  * Complete the process of sending a frame.  This method may: do nothing;
+  * await an acknowledgment; advance frame numbers; etc.
   */
-  protected void transmit (byte data) {
+  abstract protected boolean finishFrameSend();
+  // =========================================================================
 
-    if (debug) {
-      System.out.printf("DataLinkLayer.transmit(): Sending byte = %c\n",
-      data);
+
+
+  // =========================================================================
+  /**
+  * Transmit a sequence of bytes as bits.
+  *
+  * @param data The sequence of bytes to send.
+  */
+  protected void transmit (byte[] data) {
+
+    for (byte b : data) {
+
+      // Transmit one bit at a time, most to least significant.
+      for (int i = BITS_PER_BYTE - 1; i >= 0; i -= 1) {
+
+        // Grab the current bit...
+        boolean bit = ((1 << i) & b) != 0;
+
+        // ...and send it.
+        physicalLayer.send(bit);
+
+      }
+
     }
 
-    // Transmit one bit at a time, most to least significant.
-    for (int i = BITS_PER_BYTE - 1; i >= 0; i -= 1) {
-
-      // Grab the current bit...
-      boolean bit = ((1 << i) & data) != 0;
-
-      // ...and send it.
-      physicalLayer.send(bit);
-
-    }
-
-  }
+  } // transmit ()
   // =========================================================================
 
 
@@ -185,7 +248,7 @@ public abstract class DataLinkLayer {
   *            <code>0</code>, and <code>true</code> indicates a
   *            <code>1</code>.
   */
-  public void receive (boolean bit) {
+  public void receive(boolean bit) {
 
     // Add the new bit to the buffer.
     bitBuffer.add(bit);
@@ -201,26 +264,37 @@ public abstract class DataLinkLayer {
       }
 
       // ...and add it to the byte buffer.
-      byteBuffer.add(newByte);
+      receiveBuffer.add(newByte);
       if (debug) {
         System.out.printf("DataLinkLayer.receive(): Got new byte = %c\n",
         newByte);
       }
 
       // Attempt to process the buffered bytes as a frame.  If a complete
-      // frame is found and its contents extraction, deliver those
-      // contents to the client.
-      byte[] originalData = processFrame();
+      // frame is found and its contents extracted, completing receiving.
+      Queue<Byte> originalData = processFrame();
       if (originalData != null) {
-        if (debug) {
-          System.out.println("DataLinkLayer.receive(): Got a whole frame!");
-        }
-        client.receive(originalData);
+        finishFrameReceive(originalData);
       }
 
     }
 
   } // receive ()
+  // =========================================================================
+
+
+
+  // =========================================================================
+  /**
+  * An entire frame has been received.  Complete its processing, which may
+  * involve checking its correctness, responding to the sender, and/or
+  * delivering the frame to the client (if correct).  Called by
+  * <code>receive()</code>.
+  *
+  * @param data The de-tagged contents extracted from the frame.
+  * @see   DataLinkLayer.receive
+  */
+  abstract protected void finishFrameReceive (Queue<Byte> data);
   // =========================================================================
 
 
@@ -234,13 +308,13 @@ public abstract class DataLinkLayer {
   * @return if possible, the extracted data from the frame; <code>null</code>
   *         otherwise.
   */
-  abstract protected byte[] processFrame ();
-  // ===============================================================
+  abstract protected Queue<Byte> processFrame ();
+  // =========================================================================
 
 
 
   // =========================================================================
-  // DATA MEMBERS
+  // INSTANCE DATA MEMBERS
 
   /** The physical layer used by this layer. */
   protected PhysicalLayer  physicalLayer;
@@ -252,13 +326,28 @@ public abstract class DataLinkLayer {
   protected Queue<Boolean> bitBuffer;
 
   /** The buffer of bytes recently received, building up the current frame. */
-  protected Queue<Byte>    byteBuffer;
+  protected Queue<Byte>    receiveBuffer;
+
+  /** The buffer of data yet to be sent. */
+  protected Queue<Byte>    sendBuffer;
+  // =========================================================================
+
+
+
+  // =========================================================================
+  // CLASS DATA MEMBERS
 
   /** The number of bits in a byte. */
-  public static final int     BITS_PER_BYTE = 8;
+  public static final int     BITS_PER_BYTE    = 8;
+
+  /** The maximum number of original data bytes that a frame may contain. */
+  public static final int     MAX_FRAME_SIZE   = 8;
+
+  /** The duration of a timeout event (for flow control). */
+  public static final long    TIMEOUT_INTERVAL = 250;
 
   /** Whether to emit debugging information. */
-  public static final boolean debug = false;
+  public static final boolean debug            = false;
   // =========================================================================
 
 
