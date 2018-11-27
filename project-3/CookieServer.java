@@ -1,7 +1,8 @@
+package com.kylerkopacz;
 /*
 * Server for the cookie service for Networks at Amherst College, Project 3
 *
-* Written by @author@
+* Written by @author Kyler Kopacz
 *
 */
 
@@ -31,6 +32,9 @@ public class CookieServer {
   // Public Methods
   //===================================================================
 
+  /**
+   * Shows the proper command line arguments for the program, and exits.
+  */
   public static void showUsageAndExit() {
     System.out.println("invalid arguments : java CookieServer <portNumber>");
     System.exit(1);
